@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,35 +7,61 @@
 
 <style>
 body {
-    margin:0;
-    font-family: Arial;
-    background:#0b0f14;
-    color:white;
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #0b0f14;
+    color: white;
 }
 
 .header {
-    padding:20px;
-    font-size:22px;
-    text-align:center;
-    background:#111827;
+    padding: 18px;
+    text-align: center;
+    font-size: 20px;
+    font-weight: bold;
+    background: #111827;
+    border-bottom: 1px solid #1f2937;
 }
 
 .container {
-    padding:15px;
+    padding: 12px;
 }
 
 .card {
-    background:#1f2937;
-    margin:10px 0;
-    padding:15px;
-    border-radius:10px;
-    display:flex;
-    justify-content:space-between;
+    background: #1f2937;
+    margin: 10px 0;
+    padding: 14px;
+    border-radius: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: 0.2s;
 }
 
-.green {
-    color:#00ff88;
-    font-weight:bold;
+.card:hover {
+    transform: scale(1.01);
+}
+
+.symbol {
+    font-size: 14px;
+    opacity: 0.9;
+}
+
+.percent {
+    font-size: 16px;
+    font-weight: bold;
+    color: #00ff88;
+}
+
+.badge {
+    font-size: 12px;
+    opacity: 0.6;
+    margin-top: 4px;
+}
+
+.status {
+    text-align: center;
+    margin-top: 20px;
+    opacity: 0.6;
 }
 </style>
 
@@ -44,39 +70,49 @@ body {
 <body>
 
 <div class="header">
-🚀 PumpAlert Clone (OKX)
+🚀 PumpAlert Clone (OKX Monitor)
 </div>
 
 <div class="container" id="list">
-Loading...
+Loading data...
 </div>
+
+<div class="status" id="status"></div>
 
 <script>
 
 async function loadData(){
     try {
-        let res = await fetch('/api/pumps');
-        let data = await res.json();
+        const res = await fetch('/api/pumps');
+        const data = await res.json();
 
         let html = "";
 
-        if(data.length === 0){
-            html = "<p>No pumps yet...</p>";
+        if (!data || data.length === 0){
+            html = "<div class='status'>No pumps detected</div>";
+        } else {
+
+            data.forEach(item => {
+                html += `
+                <div class="card">
+                    <div>
+                        <div class="symbol">${item.symbol}</div>
+                        <div class="badge">OKX Perpetual</div>
+                    </div>
+
+                    <div class="percent">+${item.change}%</div>
+                </div>
+                `;
+            });
+
         }
 
-        data.forEach(p => {
-            html += `
-            <div class="card">
-                <div>${p.symbol}</div>
-                <div class="green">+${p.change}%</div>
-            </div>
-            `;
-        });
-
         document.getElementById("list").innerHTML = html;
+        document.getElementById("status").innerText = "Auto update: 5s";
 
-    } catch(e){
+    } catch (e) {
         document.getElementById("list").innerHTML = "Error loading data";
+        document.getElementById("status").innerText = "Server error";
     }
 }
 
