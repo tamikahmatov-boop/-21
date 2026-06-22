@@ -1,4 +1,4 @@
-from flask import Flask, send_from_directory
+from flask import Flask, send_from_directory, jsonify
 import os
 
 app = Flask(__name__, static_folder="frontend")
@@ -13,7 +13,8 @@ def test():
 
 @app.route("/api/pumps")
 def pumps():
-    return []
+    return jsonify([])
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
