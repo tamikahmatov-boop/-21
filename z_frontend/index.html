@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PumpAlert Clone</title>
+
+<style>
+body {
+    margin:0;
+    font-family: Arial;
+    background:#0b0f14;
+    color:white;
+}
+
+.header {
+    padding:20px;
+    font-size:22px;
+    text-align:center;
+    background:#111827;
+}
+
+.container {
+    padding:15px;
+}
+
+.card {
+    background:#1f2937;
+    margin:10px 0;
+    padding:15px;
+    border-radius:10px;
+    display:flex;
+    justify-content:space-between;
+}
+
+.green {
+    color:#00ff88;
+    font-weight:bold;
+}
+</style>
+
+</head>
+
+<body>
+
+<div class="header">
+🚀 PumpAlert Clone (OKX)
+</div>
+
+<div class="container" id="list">
+Loading...
+</div>
+
+<script>
+
+async function loadData(){
+    try {
+        let res = await fetch('/api/pumps');
+        let data = await res.json();
+
+        let html = "";
+
+        if(data.length === 0){
+            html = "<p>No pumps yet...</p>";
+        }
+
+        data.forEach(p => {
+            html += `
+            <div class="card">
+                <div>${p.symbol}</div>
+                <div class="green">+${p.change}%</div>
+            </div>
+            `;
+        });
+
+        document.getElementById("list").innerHTML = html;
+
+    } catch(e){
+        document.getElementById("list").innerHTML = "Error loading data";
+    }
+}
+
+setInterval(loadData, 5000);
+loadData();
+
+</script>
+
+</body>
+</html>
