@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>PumpAlert Pro</title>
+
+<style>
+
+body{
+background:#0f1117;
+color:white;
+font-family:-apple-system,sans-serif;
+margin:0;
+}
+
+.header{
+padding:25px;
+font-size:34px;
+font-weight:bold;
+}
+
+.block{
+margin:15px;
+padding:20px;
+background:#171a21;
+border-radius:20px;
+}
+
+.row{
+display:flex;
+justify-content:space-between;
+padding:15px 0;
+border-bottom:1px solid #262a35;
+}
+
+.green{
+color:#00d26a;
+font-weight:bold;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="header">
+🚀 PumpAlert Pro
+</div>
+
+<div class="block">
+
+<h2>🔥 Пампы >3% за 5 минут</h2>
+
+<div id="alerts">
+Загрузка...
+</div>
+
+</div>
+
+<script>
+
+async function loadAlerts(){
+
+try{
+
+let response = await fetch("/alerts");
+let data = await response.json();
+
+let html = "";
+
+if(data.length===0){
+html = "Пампов не найдено";
+}
+
+data.forEach(x=>{
+
+html += `
+<div class="row">
+
+<div>
+${x.symbol}
+</div>
+
+<div class="green">
++${x.change_5m}%
+</div>
+
+</div>
+`;
+
+});
+
+document.getElementById("alerts").innerHTML = html;
+
+}
+catch{
+
+document.getElementById("alerts").innerHTML =
+"Ошибка загрузки";
+
+}
+
+}
+
+loadAlerts();
+
+setInterval(loadAlerts,5000);
+
+</script>
+
+</body>
+</html>
