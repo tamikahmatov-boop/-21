@@ -10,20 +10,28 @@ def home():
 @app.route("/coins")
 def coins():
     try:
-        url = "https://api.bybit.com/v5/market/tickers?category=linear"
-        response = requests.get(url, timeout=10)
+        url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
 
         data = response.json()
+
         result = []
 
-        if "result" in data and "list" in data["result"]:
-            for x in data["result"]["list"]:
-                if x["symbol"].endswith("USDT"):
+        if "data" in data:
+            for x in data["data"]:
+                symbol = x["instId"]
+
+                if symbol.endswith("-USDT-SWAP"):
                     result.append({
-                        "symbol": x["symbol"],
-                        "price": x["lastPrice"],
-                        "change": x["price24hPcnt"]
+                        "symbol": symbol.replace("-SWAP", ""),
+                        "price": float(x["last"]),
+                        "change24h": round(float(x["change24h"]) * 100, 2)
                     })
 
         return jsonify(result)
