@@ -28,10 +28,18 @@ def coins():
                 symbol = x["instId"]
 
                 if symbol.endswith("-USDT-SWAP"):
+                    last_price = float(x["last"])
+                    open_price = float(x["sodUtc0"])
+
+                    if open_price != 0:
+                        change24h = round((last_price - open_price) / open_price * 100, 2)
+                    else:
+                        change24h = 0
+
                     result.append({
                         "symbol": symbol.replace("-SWAP", ""),
-                        "price": float(x["last"]),
-                        "change24h": round(float(x["change24h"]) * 100, 2)
+                        "price": last_price,
+                        "change24h": change24h
                     })
 
         return jsonify(result)
