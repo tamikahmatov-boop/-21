@@ -9,19 +9,28 @@ def home():
 
 @app.route("/coins")
 def coins():
-    url = "https://api.bybit.com/v5/market/tickers?category=linear"
-    data = requests.get(url, timeout=10).json()["result"]["list"]
+    try:
+        url = "https://api.bybit.com/v5/market/tickers?category=linear"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
 
-    result = []
-    for x in data:
-        if x["symbol"].endswith("USDT"):
-            result.append({
-                "symbol": x["symbol"],
-                "price": x["lastPrice"],
-                "change": x["price24hPcnt"]
-            })
+        data = response.json()
+        result = []
 
-    return jsonify(result)
+        if "result" in data and "list" in data["result"]:
+            for x in data["result"]["list"]:
+                if x["symbol"].endswith("USDT"):
+                    result.append({
+                        "symbol": x["symbol"],
+                        "price": x["lastPrice"],
+                        "change": x["price24hPcnt"]
+                    })
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
