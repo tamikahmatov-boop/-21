@@ -5,32 +5,25 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import telebot
+from telebot import types
 from pybit.unified_trading import HTTP
+
+import config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bybit-stats-bot")
 
-# ============================================================================
-# ===================  НАСТРОЙКИ — ВПИШИ СВОИ ЗНАЧЕНИЯ СЮДА  ===============
-# ============================================================================
-
-TELEGRAM_TOKEN = "8952832927:AAGvm94eVz1bzT0pzYctUvQ_dEJzZKaajy4"
-
-# Если оставить пустой строкой "" — бот будет отвечать в любом чате.
-# После первого /start бот пришлёт твой chat_id, впиши его сюда и задеплой заново.
-ALLOWED_CHAT_ID = "6716942872"
-
-BYBIT_API_KEY = "HoWywKrAcWZGHpnxXY"
-BYBIT_API_SECRET = "Jy5QRuFnhANj2TX1HMnqRY3m0JWclidsNLfY"
-
-BYBIT_TESTNET = False            # True — тестовая сеть Bybit, False — реальная
-BYBIT_CATEGORY = "linear"        # "linear" (фьючерсы USDT), "inverse" или "spot"
-
-SYNC_INTERVAL_SEC = 300          # как часто обновлять базу (в секундах), 300 = 5 мин
-INITIAL_BACKFILL_DAYS = 180      # сколько дней истории подтянуть при первом запуске
-DB_PATH = "trades.db"            # файл базы данных
-
-# ============================================================================
+# Всё, что было настройками, теперь лежит в config.py — правь данные там.
+TELEGRAM_TOKEN = config.TELEGRAM_TOKEN
+ALLOWED_CHAT_ID = config.ALLOWED_CHAT_ID
+BYBIT_API_KEY = config.BYBIT_API_KEY
+BYBIT_API_SECRET = config.BYBIT_API_SECRET
+BYBIT_TESTNET = config.BYBIT_TESTNET
+BYBIT_CATEGORY = config.BYBIT_CATEGORY
+PROXY_URL = config.PROXY_URL
+SYNC_INTERVAL_SEC = config.SYNC_INTERVAL_SEC
+INITIAL_BACKFILL_DAYS = config.INITIAL_BACKFILL_DAYS
+DB_PATH = config.DB_PATH
 
 
 # ---------------------- База данных (учёт сделок) ----------------------
@@ -62,14 +55,7 @@ def init_db():
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
         conn.close()
 
@@ -95,7 +81,6 @@ def set_last_sync_time(ts_ms: int):
 
 
 def upsert_trades(trades: list) -> int:
-    """trades: список словарей из Bybit get_closed_pnl (raw)."""
     if not trades:
         return 0
     with _db_lock:
@@ -130,7 +115,7 @@ def upsert_trades(trades: list) -> int:
     return count
 
 
-def query_stats(start_ms: int, end_ms: int) -> list:
+def query_trades(start_ms: int, end_ms: int) -> list:
     with _db_lock:
         conn = get_conn()
         rows = conn.execute(
@@ -157,14 +142,17 @@ session = HTTP(
     testnet=BYBIT_TESTNET,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
-    recv_window=20000,  # увеличенное окно на случай рассинхронизации времени сервера
+    recv_window=20000,
 )
 
+if PROXY_URL:
+    session.client.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    log.info("Использую прокси для запросов к Bybit")
 
-# ---------------------- Синхронизация сделок с Bybit в локальную базу ----------------------
+
+# ---------------------- Синхронизация закрытых сделок ----------------------
 
 def fetch_closed_pnl(start_ms: int, end_ms: int) -> list:
-    """Тянет закрытые сделки Bybit за период. Bybit ограничивает окно 7 днями за один запрос."""
     all_trades = []
     window = 7 * 24 * 60 * 60 * 1000
     cur_start = start_ms
@@ -187,7 +175,6 @@ def fetch_closed_pnl(start_ms: int, end_ms: int) -> list:
 
 
 def sync_trades() -> int:
-    """Забирает новые сделки с момента последней синхронизации и сохраняет в БД."""
     last_sync = get_last_sync_time()
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -213,37 +200,44 @@ def sync_loop():
         time.sleep(SYNC_INTERVAL_SEC)
 
 
-# ---------------------- Построение отчётов из локальной базы ----------------------
+# ---------------------- Открытые позиции и баланс ----------------------
 
-def build_stats_message(period_name: str, days: int) -> str:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-    trades = query_stats(int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+def get_open_positions() -> list:
+    resp = session.get_positions(category=BYBIT_CATEGORY, settleCoin="USDT")
+    result = resp.get("result", {}).get("list", [])
+    return [p for p in result if float(p.get("size", 0) or 0) > 0]
 
-    if not trades:
-        return f"📊 <b>Статистика ({period_name})</b>\n\nЗа этот период закрытых сделок не найдено."
 
-    total_pnl = sum(t["closed_pnl"] for t in trades)
-    wins = [t for t in trades if t["closed_pnl"] > 0]
-    losses = [t for t in trades if t["closed_pnl"] < 0]
-    win_rate = (len(wins) / len(trades) * 100) if trades else 0
-    avg_win = (sum(t["closed_pnl"] for t in wins) / len(wins)) if wins else 0
-    avg_loss = (sum(t["closed_pnl"] for t in losses) / len(losses)) if losses else 0
-    best = max(trades, key=lambda t: t["closed_pnl"])
-    worst = min(trades, key=lambda t: t["closed_pnl"])
+def build_open_positions_message() -> str:
+    positions = get_open_positions()
+    if not positions:
+        return "📭 <b>Открытых позиций нет.</b>"
 
-    msg = (
-        f"📊 <b>Статистика ({period_name})</b>\n\n"
-        f"Всего сделок: <b>{len(trades)}</b>\n"
-        f"Прибыльных: <b>{len(wins)}</b> | Убыточных: <b>{len(losses)}</b>\n"
-        f"Win rate: <b>{win_rate:.1f}%</b>\n\n"
-        f"Итоговый PnL: <b>{total_pnl:.2f} USDT</b>\n"
-        f"Средняя прибыль: <b>{avg_win:.2f} USDT</b>\n"
-        f"Средний убыток: <b>{avg_loss:.2f} USDT</b>\n\n"
-        f"🏆 Лучшая сделка: {best['symbol']} ({best['closed_pnl']:.2f} USDT)\n"
-        f"💀 Худшая сделка: {worst['symbol']} ({worst['closed_pnl']:.2f} USDT)"
-    )
-    return msg
+    lines = [f"📈 <b>Открытые позиции ({len(positions)})</b>\n"]
+    total_upl = 0.0
+    for p in positions:
+        symbol = p.get("symbol")
+        side = "🟢 Long" if p.get("side") == "Buy" else "🔴 Short"
+        size = p.get("size")
+        entry = float(p.get("avgPrice", 0) or 0)
+        mark = float(p.get("markPrice", 0) or 0)
+        upl = float(p.get("unrealisedPnl", 0) or 0)
+        leverage = p.get("leverage", "?")
+        total_upl += upl
+
+        pct = ((mark - entry) / entry * 100) if entry else 0
+        if p.get("side") == "Sell":
+            pct = -pct
+
+        emoji = "🟩" if upl >= 0 else "🟥"
+        lines.append(
+            f"{emoji} <b>{symbol}</b> {side} x{leverage}\n"
+            f"   Объём: {size} | Вход: {entry:g} | Маркет: {mark:g}\n"
+            f"   PnL: <b>{upl:.2f} USDT</b> ({pct:+.2f}%)\n"
+        )
+
+    lines.append(f"\n💵 <b>Суммарный нереализованный PnL: {total_upl:.2f} USDT</b>")
+    return "\n".join(lines)
 
 
 def get_balance_message() -> str:
@@ -255,105 +249,264 @@ def get_balance_message() -> str:
     account = result[0]
     total_equity = account.get("totalEquity", "N/A")
     total_pnl_unrealized = account.get("totalPerpUPL", "N/A")
+    available = account.get("totalAvailableBalance", "N/A")
 
-    lines = [f"💰 <b>Баланс аккаунта</b>\n", f"Общий эквити: <b>{float(total_equity):.2f} USDT</b>"]
+    lines = ["💰 <b>Баланс аккаунта</b>\n"]
+    lines.append(f"Общий эквити: <b>{float(total_equity):.2f} USDT</b>")
+    if available not in ("N/A", None, ""):
+        lines.append(f"Доступно: <b>{float(available):.2f} USDT</b>")
     if total_pnl_unrealized not in ("N/A", None, ""):
         lines.append(f"Нереализованный PnL: <b>{float(total_pnl_unrealized):.2f} USDT</b>")
 
     return "\n".join(lines)
 
 
-# ---------------------- Проверка доступа ----------------------
+# ---------------------- Расширенная статистика по закрытым сделкам ----------------------
 
-def is_allowed(message) -> bool:
-    if not ALLOWED_CHAT_ID:
-        return True
-    return str(message.chat.id) == str(ALLOWED_CHAT_ID)
+def compute_stats(trades: list) -> dict:
+    total_pnl = sum(t["closed_pnl"] for t in trades)
+    wins = [t for t in trades if t["closed_pnl"] > 0]
+    losses = [t for t in trades if t["closed_pnl"] < 0]
+    breakeven = [t for t in trades if t["closed_pnl"] == 0]
 
+    win_sum = sum(t["closed_pnl"] for t in wins)
+    loss_sum = sum(t["closed_pnl"] for t in losses)  # отрицательное число
 
-# ---------------------- Хендлеры команд ----------------------
+    win_rate = (len(wins) / len(trades) * 100) if trades else 0
+    avg_win = (win_sum / len(wins)) if wins else 0
+    avg_loss = (loss_sum / len(losses)) if losses else 0
+    profit_factor = (win_sum / abs(loss_sum)) if loss_sum != 0 else float("inf") if win_sum > 0 else 0
 
-@bot.message_handler(commands=["start", "help"])
-def cmd_start(message):
-    if not is_allowed(message):
-        return
-    bot.reply_to(
-        message,
-        "Привет! Я бот для учёта сделок Bybit.\n"
-        "Я сам сохраняю все твои закрытые сделки в базу и веду постоянную статистику.\n\n"
-        "Команды:\n"
-        "/stats_today — статистика за сегодня\n"
-        "/stats_week — статистика за 7 дней\n"
-        "/stats_month — статистика за 30 дней\n"
-        "/stats_all — статистика за всё время учёта\n"
-        "/balance — текущий баланс аккаунта\n"
-        "/sync — принудительно обновить базу прямо сейчас\n\n"
-        f"Твой chat_id: <code>{message.chat.id}</code>",
+    best = max(trades, key=lambda t: t["closed_pnl"]) if trades else None
+    worst = min(trades, key=lambda t: t["closed_pnl"]) if trades else None
+
+    # текущая серия побед/поражений (по последним сделкам в хронологическом порядке)
+    streak_type, streak_len = None, 0
+    for t in reversed(trades):
+        pnl = t["closed_pnl"]
+        cur_type = "win" if pnl > 0 else ("loss" if pnl < 0 else None)
+        if cur_type is None:
+            break
+        if streak_type is None:
+            streak_type = cur_type
+            streak_len = 1
+        elif cur_type == streak_type:
+            streak_len += 1
+        else:
+            break
+
+    # максимальная просадка по накопительному PnL
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for t in trades:
+        cum += t["closed_pnl"]
+        peak = max(peak, cum)
+        max_dd = min(max_dd, cum - peak)
+
+    # средняя длительность сделки
+    durations = [
+        (t["updated_time"] - t["created_time"]) / 1000 / 60
+        for t in trades
+        if t["updated_time"] and t["created_time"] and t["updated_time"] > t["created_time"]
+    ]
+    avg_duration_min = sum(durations) / len(durations) if durations else 0
+
+    # разбивка по инструментам (топ-5 по количеству сделок)
+    by_symbol = {}
+    for t in trades:
+        s = t["symbol"]
+        by_symbol.setdefault(s, {"count": 0, "pnl": 0.0})
+        by_symbol[s]["count"] += 1
+        by_symbol[s]["pnl"] += t["closed_pnl"]
+    top_symbols = sorted(by_symbol.items(), key=lambda kv: kv[1]["count"], reverse=True)[:5]
+
+    return dict(
+        total=len(trades),
+        total_pnl=total_pnl,
+        wins=len(wins),
+        losses=len(losses),
+        breakeven=len(breakeven),
+        win_rate=win_rate,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        profit_factor=profit_factor,
+        best=best,
+        worst=worst,
+        streak_type=streak_type,
+        streak_len=streak_len,
+        max_dd=max_dd,
+        avg_duration_min=avg_duration_min,
+        top_symbols=top_symbols,
     )
 
 
-def _reply_stats(message, period_name, days):
-    if not is_allowed(message):
+def build_stats_message(period_name: str, days: int) -> str:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    trades = query_trades(int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+
+    if not trades:
+        return f"📊 <b>Статистика ({period_name})</b>\n\nЗа этот период закрытых сделок не найдено."
+
+    s = compute_stats(trades)
+
+    pf_str = "∞" if s["profit_factor"] == float("inf") else f"{s['profit_factor']:.2f}"
+    streak_emoji = "🔥" if s["streak_type"] == "win" else "❄️"
+    streak_str = f"{streak_emoji} {s['streak_len']} {'побед' if s['streak_type'] == 'win' else 'поражений'} подряд" if s["streak_type"] else "—"
+
+    duration_str = (
+        f"{s['avg_duration_min']:.0f} мин" if s["avg_duration_min"] < 180
+        else f"{s['avg_duration_min']/60:.1f} ч"
+    )
+
+    lines = [
+        f"📊 <b>Статистика ({period_name})</b>\n",
+        f"Всего сделок: <b>{s['total']}</b>",
+        f"Прибыльных: <b>{s['wins']}</b> | Убыточных: <b>{s['losses']}</b> | В ноль: {s['breakeven']}",
+        f"Win rate: <b>{s['win_rate']:.1f}%</b>",
+        f"Текущая серия: {streak_str}\n",
+        f"Итоговый PnL: <b>{s['total_pnl']:.2f} USDT</b>",
+        f"Profit factor: <b>{pf_str}</b>",
+        f"Средняя прибыль: <b>{s['avg_win']:.2f} USDT</b>",
+        f"Средний убыток: <b>{s['avg_loss']:.2f} USDT</b>",
+        f"Макс. просадка (по закрытым): <b>{s['max_dd']:.2f} USDT</b>",
+        f"Средняя длительность сделки: <b>{duration_str}</b>\n",
+        f"🏆 Лучшая: {s['best']['symbol']} ({s['best']['closed_pnl']:.2f} USDT)",
+        f"💀 Худшая: {s['worst']['symbol']} ({s['worst']['closed_pnl']:.2f} USDT)",
+    ]
+
+    if s["top_symbols"]:
+        lines.append("\n📋 <b>По инструментам:</b>")
+        for symbol, data in s["top_symbols"]:
+            emoji = "🟩" if data["pnl"] >= 0 else "🟥"
+            lines.append(f"{emoji} {symbol}: {data['count']} сделок, {data['pnl']:.2f} USDT")
+
+    return "\n".join(lines)
+
+
+# ---------------------- Проверка доступа ----------------------
+
+def is_allowed(chat_id) -> bool:
+    if not ALLOWED_CHAT_ID:
+        return True
+    return str(chat_id) == str(ALLOWED_CHAT_ID)
+
+
+# ---------------------- Меню (кнопки) ----------------------
+
+def main_menu() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📊 Статистика", callback_data="menu_stats"),
+        types.InlineKeyboardButton("📈 Открытые позиции", callback_data="open_positions"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+        types.InlineKeyboardButton("🔄 Синхронизировать", callback_data="sync"),
+    )
+    return kb
+
+
+def stats_menu() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("Сегодня", callback_data="stats_1"),
+        types.InlineKeyboardButton("7 дней", callback_data="stats_7"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("30 дней", callback_data="stats_30"),
+        types.InlineKeyboardButton("Всё время", callback_data="stats_3650"),
+    )
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+    return kb
+
+
+def back_menu() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+    return kb
+
+
+# ---------------------- Хендлеры ----------------------
+
+@bot.message_handler(commands=["start", "help", "menu"])
+def cmd_start(message):
+    if not is_allowed(message.chat.id):
         return
-    bot.send_chat_action(message.chat.id, "typing")
-    try:
-        msg = build_stats_message(period_name, days)
-    except Exception as e:
-        msg = f"Ошибка при получении статистики: {e}"
-        log.exception("stats error")
-    bot.reply_to(message, msg)
+    bot.send_message(
+        message.chat.id,
+        "Привет! Я бот для учёта сделок Bybit.\n"
+        "Я сам сохраняю закрытые сделки в базу и слежу за открытыми позициями.\n\n"
+        f"Твой chat_id: <code>{message.chat.id}</code>\n\n"
+        "Выбери, что показать:",
+        reply_markup=main_menu(),
+    )
 
 
-@bot.message_handler(commands=["stats_today"])
-def cmd_stats_today(message):
-    _reply_stats(message, "сегодня", 1)
-
-
-@bot.message_handler(commands=["stats_week"])
-def cmd_stats_week(message):
-    _reply_stats(message, "7 дней", 7)
-
-
-@bot.message_handler(commands=["stats_month"])
-def cmd_stats_month(message):
-    _reply_stats(message, "30 дней", 30)
-
-
-@bot.message_handler(commands=["stats_all"])
-def cmd_stats_all(message):
-    _reply_stats(message, "всё время", 3650)
-
-
-@bot.message_handler(commands=["balance"])
-def cmd_balance(message):
-    if not is_allowed(message):
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    if not is_allowed(call.message.chat.id):
         return
-    bot.send_chat_action(message.chat.id, "typing")
-    try:
-        msg = get_balance_message()
-    except Exception as e:
-        msg = f"Ошибка при получении баланса: {e}"
-        log.exception("balance error")
-    bot.reply_to(message, msg)
 
+    data = call.data
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
 
-@bot.message_handler(commands=["sync"])
-def cmd_sync(message):
-    if not is_allowed(message):
-        return
-    bot.reply_to(message, "🔄 Синхронизирую сделки с Bybit...")
     try:
-        saved = sync_trades()
-        total = total_trade_count()
-        bot.reply_to(message, f"Готово. Новых сделок сохранено: {saved}. Всего в базе: {total}.")
+        if data == "menu_main":
+            bot.edit_message_text("Выбери, что показать:", chat_id, msg_id, reply_markup=main_menu())
+
+        elif data == "menu_stats":
+            bot.edit_message_text("За какой период показать статистику?", chat_id, msg_id, reply_markup=stats_menu())
+
+        elif data.startswith("stats_"):
+            days = int(data.split("_")[1])
+            period_name = {1: "сегодня", 7: "7 дней", 30: "30 дней", 3650: "всё время"}.get(days, f"{days} дней")
+            bot.answer_callback_query(call.id, "Считаю...")
+            msg = build_stats_message(period_name, days)
+            bot.edit_message_text(msg, chat_id, msg_id, reply_markup=stats_menu())
+
+        elif data == "open_positions":
+            bot.answer_callback_query(call.id, "Загружаю позиции...")
+            msg = build_open_positions_message()
+            bot.edit_message_text(msg, chat_id, msg_id, reply_markup=back_menu())
+
+        elif data == "balance":
+            bot.answer_callback_query(call.id, "Загружаю баланс...")
+            msg = get_balance_message()
+            bot.edit_message_text(msg, chat_id, msg_id, reply_markup=back_menu())
+
+        elif data == "sync":
+            bot.answer_callback_query(call.id, "Синхронизирую...")
+            saved = sync_trades()
+            total = total_trade_count()
+            bot.edit_message_text(
+                f"✅ Готово.\nНовых сделок сохранено: {saved}\nВсего в базе: {total}",
+                chat_id, msg_id, reply_markup=back_menu(),
+            )
+
+        else:
+            bot.answer_callback_query(call.id)
+
     except Exception as e:
-        bot.reply_to(message, f"Ошибка синхронизации: {e}")
-        log.exception("manual sync error")
+        log.exception("Ошибка обработки кнопки")
+        try:
+            bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
+        except Exception:
+            pass
 
 
 # ---------------------- Точка входа ----------------------
 
 if __name__ == "__main__":
+    try:
+        import requests
+        my_ip = requests.get("https://api.ipify.org", timeout=5).text
+        log.info("Внешний IP этого сервера: %s", my_ip)
+    except Exception as e:
+        log.warning("Не удалось определить внешний IP: %s", e)
+
     init_db()
     threading.Thread(target=sync_loop, daemon=True).start()
 
