@@ -29,6 +29,10 @@ DB_PATH = config.DB_PATH
 NOTIFY_ON_NEW_TRADE = getattr(config, "NOTIFY_ON_NEW_TRADE", True)
 ENABLE_DAILY_REPORT = getattr(config, "ENABLE_DAILY_REPORT", True)
 DAILY_REPORT_HOUR_UTC = getattr(config, "DAILY_REPORT_HOUR_UTC", 6)
+ENABLE_WEEKLY_REPORT = getattr(config, "ENABLE_WEEKLY_REPORT", True)
+WEEKLY_REPORT_WEEKDAY = getattr(config, "WEEKLY_REPORT_WEEKDAY", 6)
+WEEKLY_REPORT_HOUR_UTC = getattr(config, "WEEKLY_REPORT_HOUR_UTC", 18)
+MAX_DAILY_LOSS_ALERT = getattr(config, "MAX_DAILY_LOSS_ALERT", 0)
 
 START_TIME = datetime.now(timezone.utc)
 
@@ -241,7 +245,34 @@ def sync_trades(silent_notify=False) -> int:
         for t in new_trades:
             notify_new_trade(t)
 
+    if not is_first_run and MAX_DAILY_LOSS_ALERT > 0 and ALLOWED_CHAT_ID:
+        check_daily_loss_alert()
+
     return len(new_trades)
+
+
+def check_daily_loss_alert():
+    """Если суммарный убыток за текущие сутки (UTC) превышает лимит — шлём предупреждение один раз в сутки."""
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    already_alerted = get_meta("loss_alert_date", "")
+    if already_alerted == today_str:
+        return
+
+    day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    trades_today = query_trades(int(day_start.timestamp() * 1000), int(datetime.now(timezone.utc).timestamp() * 1000))
+    pnl_today = sum(t["closed_pnl"] for t in trades_today)
+
+    if pnl_today <= -abs(MAX_DAILY_LOSS_ALERT):
+        try:
+            bot.send_message(
+                ALLOWED_CHAT_ID,
+                f"⚠️ <b>Риск-алерт</b>\n\nУбыток за сегодня составил <b>{pnl_today:.2f} USDT</b>, "
+                f"это превышает установленный лимит ({MAX_DAILY_LOSS_ALERT} USDT).\n"
+                f"Возможно, стоит сделать паузу в торговле.",
+            )
+            set_meta("loss_alert_date", today_str)
+        except Exception:
+            log.exception("Не удалось отправить риск-алерт")
 
 
 def notify_new_trade(t: dict):
@@ -286,6 +317,25 @@ def daily_report_loop():
                 last_sent_date = today_str
             except Exception:
                 log.exception("Ошибка отправки ежедневного отчёта")
+        time.sleep(60)
+
+
+def weekly_report_loop():
+    """Раз в неделю в заданный день/час отправляет итоги недели."""
+    if not ENABLE_WEEKLY_REPORT or not ALLOWED_CHAT_ID:
+        return
+    last_sent_week = get_meta("last_weekly_report_week", "")
+    while True:
+        now = datetime.now(timezone.utc)
+        week_key = now.strftime("%G-W%V")
+        if now.weekday() == WEEKLY_REPORT_WEEKDAY and now.hour == WEEKLY_REPORT_HOUR_UTC and week_key != last_sent_week:
+            try:
+                msg = "📅 <b>Итоги недели</b>\n\n" + build_stats_message("7 дней", 7)
+                bot.send_message(ALLOWED_CHAT_ID, msg)
+                set_meta("last_weekly_report_week", week_key)
+                last_sent_week = week_key
+            except Exception:
+                log.exception("Ошибка отправки еженедельного отчёта")
         time.sleep(60)
 
 
@@ -422,11 +472,26 @@ def compute_stats(trades: list) -> dict:
     # разбивка по инструментам (топ-5 по количеству сделок)
     by_symbol = {}
     for t in trades:
-        s = t["symbol"]
-        by_symbol.setdefault(s, {"count": 0, "pnl": 0.0})
-        by_symbol[s]["count"] += 1
-        by_symbol[s]["pnl"] += t["closed_pnl"]
+        sym = t["symbol"]
+        by_symbol.setdefault(sym, {"count": 0, "pnl": 0.0})
+        by_symbol[sym]["count"] += 1
+        by_symbol[sym]["pnl"] += t["closed_pnl"]
     top_symbols = sorted(by_symbol.items(), key=lambda kv: kv[1]["count"], reverse=True)[:5]
+
+    # анализ по дням недели и часам (когда сделки прибыльнее/убыточнее)
+    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    by_weekday = {i: 0.0 for i in range(7)}
+    by_hour = {i: 0.0 for i in range(24)}
+    for t in trades:
+        if t["updated_time"]:
+            dt = datetime.fromtimestamp(t["updated_time"] / 1000, tz=timezone.utc)
+            by_weekday[dt.weekday()] += t["closed_pnl"]
+            by_hour[dt.hour] += t["closed_pnl"]
+
+    best_weekday = max(by_weekday.items(), key=lambda kv: kv[1]) if trades else None
+    worst_weekday = min(by_weekday.items(), key=lambda kv: kv[1]) if trades else None
+    best_hour = max(by_hour.items(), key=lambda kv: kv[1]) if trades else None
+    worst_hour = min(by_hour.items(), key=lambda kv: kv[1]) if trades else None
 
     return dict(
         total=len(trades),
@@ -449,6 +514,11 @@ def compute_stats(trades: list) -> dict:
         avg_duration_min=avg_duration_min,
         top_symbols=top_symbols,
         equity_curve=equity_curve,
+        weekday_names=weekday_names,
+        best_weekday=best_weekday,
+        worst_weekday=worst_weekday,
+        best_hour=best_hour,
+        worst_hour=worst_hour,
     )
 
 
@@ -520,6 +590,18 @@ def build_stats_message(period_name: str, days: int, symbol: str = None) -> str:
         for sym, data in s["top_symbols"]:
             emoji = "🟩" if data["pnl"] >= 0 else "🟥"
             lines.append(f"{emoji} {sym}: {data['count']} сделок, {data['pnl']:.2f} USDT")
+
+    if days >= 7 and s["total"] >= 5:
+        wd = s["weekday_names"]
+        lines.append("\n🗓 <b>По времени (UTC):</b>")
+        if s["best_weekday"] and s["best_weekday"][1] > 0:
+            lines.append(f"Лучший день недели: {wd[s['best_weekday'][0]]} ({s['best_weekday'][1]:.2f} USDT)")
+        if s["worst_weekday"] and s["worst_weekday"][1] < 0:
+            lines.append(f"Худший день недели: {wd[s['worst_weekday'][0]]} ({s['worst_weekday'][1]:.2f} USDT)")
+        if s["best_hour"] and s["best_hour"][1] > 0:
+            lines.append(f"Лучший час: {s['best_hour'][0]}:00 ({s['best_hour'][1]:.2f} USDT)")
+        if s["worst_hour"] and s["worst_hour"][1] < 0:
+            lines.append(f"Худший час: {s['worst_hour'][0]}:00 ({s['worst_hour'][1]:.2f} USDT)")
 
     return "\n".join(lines)
 
@@ -605,6 +687,8 @@ def build_status_message() -> str:
         f"Категория Bybit: {BYBIT_CATEGORY} | Testnet: {BYBIT_TESTNET}",
         f"Уведомления о сделках: {'вкл' if NOTIFY_ON_NEW_TRADE else 'выкл'}",
         f"Ежедневный отчёт: {'вкл в ' + str(DAILY_REPORT_HOUR_UTC) + ':00 UTC' if ENABLE_DAILY_REPORT else 'выкл'}",
+        f"Еженедельный отчёт: {'вкл' if ENABLE_WEEKLY_REPORT else 'выкл'}",
+        f"Риск-алерт по убытку: {(str(MAX_DAILY_LOSS_ALERT) + ' USDT/сутки') if MAX_DAILY_LOSS_ALERT > 0 else 'выкл'}",
     ]
     return "\n".join(lines)
 
@@ -640,6 +724,7 @@ def main_menu() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("🔄 Синхронизировать", callback_data="sync"),
         types.InlineKeyboardButton("ℹ️ Статус", callback_data="status"),
     )
+    kb.add(types.InlineKeyboardButton("💾 Резервная копия базы", callback_data="backup"))
     return kb
 
 
@@ -648,6 +733,17 @@ def period_menu(prefix: str) -> types.InlineKeyboardMarkup:
     buttons = [types.InlineKeyboardButton(name, callback_data=f"{prefix}_{days}") for name, days in PERIODS]
     kb.add(*buttons)
     kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+    return kb
+
+
+def stats_result_menu(days: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    buttons = [types.InlineKeyboardButton(name, callback_data=f"stats_{d}") for name, d in PERIODS]
+    kb.add(*buttons)
+    kb.add(
+        types.InlineKeyboardButton("🔄 Обновить", callback_data=f"stats_{days}"),
+        types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"),
+    )
     return kb
 
 
@@ -715,7 +811,7 @@ def handle_callback(call):
             days = int(data.split("_")[1])
             bot.answer_callback_query(call.id, "Считаю...")
             msg = build_stats_message(PERIOD_NAMES.get(days, f"{days} дней"), days)
-            bot.edit_message_text(msg, chat_id, msg_id, reply_markup=period_menu("stats"))
+            bot.edit_message_text(msg, chat_id, msg_id, reply_markup=stats_result_menu(days))
 
         elif data.startswith("symstat_"):
             symbol = data.split("_", 1)[1]
@@ -757,6 +853,14 @@ def handle_callback(call):
             msg = build_status_message()
             bot.edit_message_text(msg, chat_id, msg_id, reply_markup=back_menu())
 
+        elif data == "backup":
+            bot.answer_callback_query(call.id, "Готовлю файл базы...")
+            try:
+                with open(DB_PATH, "rb") as f:
+                    bot.send_document(chat_id, types.InputFile(f, filename="trades_backup.db"), reply_markup=back_menu())
+            except FileNotFoundError:
+                bot.send_message(chat_id, "База данных пока пуста.", reply_markup=back_menu())
+
         elif data == "sync":
             bot.answer_callback_query(call.id, "Синхронизирую...")
             saved = sync_trades(silent_notify=True)
@@ -790,6 +894,7 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=sync_loop, daemon=True).start()
     threading.Thread(target=daily_report_loop, daemon=True).start()
+    threading.Thread(target=weekly_report_loop, daemon=True).start()
 
     log.info("Бот запущен. Ожидаю команды...")
     while True:
