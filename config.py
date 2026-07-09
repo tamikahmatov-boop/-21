@@ -28,3 +28,12 @@ NOTIFY_ON_NEW_TRADE = True
 # Автоматический ежедневный отчёт со статистикой за сутки (нужен ALLOWED_CHAT_ID)
 ENABLE_DAILY_REPORT = True
 DAILY_REPORT_HOUR_UTC = 6        # час отправки отчёта по UTC (6 = 9:00 МСК)
+
+# Автоматический еженедельный отчёт (итоги недели)
+ENABLE_WEEKLY_REPORT = True
+WEEKLY_REPORT_WEEKDAY = 6        # 0 = понедельник ... 6 = воскресенье
+WEEKLY_REPORT_HOUR_UTC = 18
+
+# Риск-алерт: если суммарный убыток за текущие сутки (по МСК/UTC) превышает это
+# значение в USDT — бот сразу пришлёт предупреждение. 0 — выключить.
+MAX_DAILY_LOSS_ALERT = 0
