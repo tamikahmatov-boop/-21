@@ -14,14 +14,14 @@ log = logging.getLogger("bybit-stats-bot")
 # ===================  НАСТРОЙКИ — ВПИШИ СВОИ ЗНАЧЕНИЯ СЮДА  ===============
 # ============================================================================
 
-TELEGRAM_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER"
+TELEGRAM_TOKEN = "8952832927:AAGvm94eVz1bzT0pzYctUvQ_dEJzZKaajy4"
 
 # Если оставить пустой строкой "" — бот будет отвечать в любом чате.
 # После первого /start бот пришлёт твой chat_id, впиши его сюда и задеплой заново.
-ALLOWED_CHAT_ID = ""
+ALLOWED_CHAT_ID = "6716942872"
 
-BYBIT_API_KEY = "ВСТАВЬ_СЮДА_BYBIT_API_KEY"
-BYBIT_API_SECRET = "ВСТАВЬ_СЮДА_BYBIT_API_SECRET"
+BYBIT_API_KEY = "HoWywKrAcWZGHpnxXY"
+BYBIT_API_SECRET = "Jy5QRuFnhANj2TX1HMnqRY3m0JWclidsNLfY"
 
 BYBIT_TESTNET = False            # True — тестовая сеть Bybit, False — реальная
 BYBIT_CATEGORY = "linear"        # "linear" (фьючерсы USDT), "inverse" или "spot"
