@@ -21,3 +21,10 @@ PROXY_URL = ""
 SYNC_INTERVAL_SEC = 300          # как часто обновлять базу (в секундах), 300 = 5 мин
 INITIAL_BACKFILL_DAYS = 180      # сколько дней истории подтянуть при первом запуске
 DB_PATH = "trades.db"            # файл базы данных
+
+# Мгновенные уведомления в Telegram при закрытии новой сделки (нужен ALLOWED_CHAT_ID)
+NOTIFY_ON_NEW_TRADE = True
+
+# Автоматический ежедневный отчёт со статистикой за сутки (нужен ALLOWED_CHAT_ID)
+ENABLE_DAILY_REPORT = True
+DAILY_REPORT_HOUR_UTC = 6        # час отправки отчёта по UTC (6 = 9:00 МСК)
