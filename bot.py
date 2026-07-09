@@ -159,6 +159,26 @@ def total_trade_count() -> int:
     return row["c"] if row else 0
 
 
+# ---------------------- Настройки, изменяемые кнопками (хранятся в БД поверх config.py) ----------------------
+
+def get_setting(name: str, default):
+    val = get_meta(f"setting_{name}", None)
+    if val is None:
+        return default
+    if isinstance(default, bool):
+        return val == "True"
+    if isinstance(default, int):
+        try:
+            return int(val)
+        except ValueError:
+            return default
+    return val
+
+
+def set_setting(name: str, value):
+    set_meta(f"setting_{name}", value)
+
+
 def distinct_symbols() -> list:
     with _db_lock:
         conn = get_conn()
@@ -241,17 +261,18 @@ def sync_trades(silent_notify=False) -> int:
     set_last_sync_time(now_ms)
     log.info("Синхронизация: получено %s сделок, новых записей: %s", len(trades), len(new_trades))
 
-    if NOTIFY_ON_NEW_TRADE and not silent_notify and not is_first_run and new_trades and ALLOWED_CHAT_ID:
+    if get_setting("notify_new_trade", NOTIFY_ON_NEW_TRADE) and not silent_notify and not is_first_run and new_trades and ALLOWED_CHAT_ID:
         for t in new_trades:
             notify_new_trade(t)
 
-    if not is_first_run and MAX_DAILY_LOSS_ALERT > 0 and ALLOWED_CHAT_ID:
-        check_daily_loss_alert()
+    loss_limit = get_setting("max_daily_loss_alert", MAX_DAILY_LOSS_ALERT)
+    if not is_first_run and loss_limit > 0 and ALLOWED_CHAT_ID:
+        check_daily_loss_alert(loss_limit)
 
     return len(new_trades)
 
 
-def check_daily_loss_alert():
+def check_daily_loss_alert(loss_limit: int):
     """Если суммарный убыток за текущие сутки (UTC) превышает лимит — шлём предупреждение один раз в сутки."""
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     already_alerted = get_meta("loss_alert_date", "")
@@ -262,12 +283,12 @@ def check_daily_loss_alert():
     trades_today = query_trades(int(day_start.timestamp() * 1000), int(datetime.now(timezone.utc).timestamp() * 1000))
     pnl_today = sum(t["closed_pnl"] for t in trades_today)
 
-    if pnl_today <= -abs(MAX_DAILY_LOSS_ALERT):
+    if pnl_today <= -abs(loss_limit):
         try:
             bot.send_message(
                 ALLOWED_CHAT_ID,
                 f"⚠️ <b>Риск-алерт</b>\n\nУбыток за сегодня составил <b>{pnl_today:.2f} USDT</b>, "
-                f"это превышает установленный лимит ({MAX_DAILY_LOSS_ALERT} USDT).\n"
+                f"это превышает установленный лимит ({loss_limit} USDT).\n"
                 f"Возможно, стоит сделать паузу в торговле.",
             )
             set_meta("loss_alert_date", today_str)
@@ -298,44 +319,46 @@ def sync_loop():
             sync_trades()
         except Exception as e:
             log.error("Ошибка синхронизации: %s", str(e))
-        time.sleep(SYNC_INTERVAL_SEC)
+        time.sleep(get_setting("sync_interval_sec", SYNC_INTERVAL_SEC))
 
 
 def daily_report_loop():
     """Раз в сутки в заданный час отправляет статистику за прошедшие сутки."""
-    if not ENABLE_DAILY_REPORT or not ALLOWED_CHAT_ID:
+    if not ALLOWED_CHAT_ID:
         return
     last_sent_date = get_meta("last_daily_report_date", "")
     while True:
-        now = datetime.now(timezone.utc)
-        today_str = now.strftime("%Y-%m-%d")
-        if now.hour == DAILY_REPORT_HOUR_UTC and today_str != last_sent_date:
-            try:
-                msg = "🗓 <b>Ежедневный отчёт</b>\n\n" + build_stats_message("сутки", 1)
-                bot.send_message(ALLOWED_CHAT_ID, msg)
-                set_meta("last_daily_report_date", today_str)
-                last_sent_date = today_str
-            except Exception:
-                log.exception("Ошибка отправки ежедневного отчёта")
+        if get_setting("enable_daily_report", ENABLE_DAILY_REPORT):
+            now = datetime.now(timezone.utc)
+            today_str = now.strftime("%Y-%m-%d")
+            if now.hour == DAILY_REPORT_HOUR_UTC and today_str != last_sent_date:
+                try:
+                    msg = "🗓 <b>Ежедневный отчёт</b>\n\n" + build_stats_message("сутки", 1)
+                    bot.send_message(ALLOWED_CHAT_ID, msg)
+                    set_meta("last_daily_report_date", today_str)
+                    last_sent_date = today_str
+                except Exception:
+                    log.exception("Ошибка отправки ежедневного отчёта")
         time.sleep(60)
 
 
 def weekly_report_loop():
     """Раз в неделю в заданный день/час отправляет итоги недели."""
-    if not ENABLE_WEEKLY_REPORT or not ALLOWED_CHAT_ID:
+    if not ALLOWED_CHAT_ID:
         return
     last_sent_week = get_meta("last_weekly_report_week", "")
     while True:
-        now = datetime.now(timezone.utc)
-        week_key = now.strftime("%G-W%V")
-        if now.weekday() == WEEKLY_REPORT_WEEKDAY and now.hour == WEEKLY_REPORT_HOUR_UTC and week_key != last_sent_week:
-            try:
-                msg = "📅 <b>Итоги недели</b>\n\n" + build_stats_message("7 дней", 7)
-                bot.send_message(ALLOWED_CHAT_ID, msg)
-                set_meta("last_weekly_report_week", week_key)
-                last_sent_week = week_key
-            except Exception:
-                log.exception("Ошибка отправки еженедельного отчёта")
+        if get_setting("enable_weekly_report", ENABLE_WEEKLY_REPORT):
+            now = datetime.now(timezone.utc)
+            week_key = now.strftime("%G-W%V")
+            if now.weekday() == WEEKLY_REPORT_WEEKDAY and now.hour == WEEKLY_REPORT_HOUR_UTC and week_key != last_sent_week:
+                try:
+                    msg = "📅 <b>Итоги недели</b>\n\n" + build_stats_message("7 дней", 7)
+                    bot.send_message(ALLOWED_CHAT_ID, msg)
+                    set_meta("last_weekly_report_week", week_key)
+                    last_sent_week = week_key
+                except Exception:
+                    log.exception("Ошибка отправки еженедельного отчёта")
         time.sleep(60)
 
 
@@ -678,17 +701,24 @@ def build_status_message() -> str:
 
     total = total_trade_count()
 
+    notify = get_setting("notify_new_trade", NOTIFY_ON_NEW_TRADE)
+    daily = get_setting("enable_daily_report", ENABLE_DAILY_REPORT)
+    weekly = get_setting("enable_weekly_report", ENABLE_WEEKLY_REPORT)
+    loss_limit = get_setting("max_daily_loss_alert", MAX_DAILY_LOSS_ALERT)
+    sync_interval = get_setting("sync_interval_sec", SYNC_INTERVAL_SEC)
+    category = get_setting("bybit_category", BYBIT_CATEGORY)
+
     lines = [
         "ℹ️ <b>Статус бота</b>\n",
         f"Аптайм: <b>{hours} ч {minutes} мин</b>",
         f"Сделок в базе: <b>{total}</b>",
         f"Последняя синхронизация: <b>{last_sync_str}</b>",
-        f"Интервал синхронизации: {SYNC_INTERVAL_SEC} сек",
-        f"Категория Bybit: {BYBIT_CATEGORY} | Testnet: {BYBIT_TESTNET}",
-        f"Уведомления о сделках: {'вкл' if NOTIFY_ON_NEW_TRADE else 'выкл'}",
-        f"Ежедневный отчёт: {'вкл в ' + str(DAILY_REPORT_HOUR_UTC) + ':00 UTC' if ENABLE_DAILY_REPORT else 'выкл'}",
-        f"Еженедельный отчёт: {'вкл' if ENABLE_WEEKLY_REPORT else 'выкл'}",
-        f"Риск-алерт по убытку: {(str(MAX_DAILY_LOSS_ALERT) + ' USDT/сутки') if MAX_DAILY_LOSS_ALERT > 0 else 'выкл'}",
+        f"Интервал синхронизации: {sync_interval} сек",
+        f"Категория Bybit: {category} | Testnet: {BYBIT_TESTNET}",
+        f"Уведомления о сделках: {'вкл' if notify else 'выкл'}",
+        f"Ежедневный отчёт: {'вкл в ' + str(DAILY_REPORT_HOUR_UTC) + ':00 UTC' if daily else 'выкл'}",
+        f"Еженедельный отчёт: {'вкл' if weekly else 'выкл'}",
+        f"Риск-алерт по убытку: {(str(loss_limit) + ' USDT/сутки') if loss_limit > 0 else 'выкл'}",
     ]
     return "\n".join(lines)
 
@@ -724,7 +754,10 @@ def main_menu() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("🔄 Синхронизировать", callback_data="sync"),
         types.InlineKeyboardButton("ℹ️ Статус", callback_data="status"),
     )
-    kb.add(types.InlineKeyboardButton("💾 Резервная копия базы", callback_data="backup"))
+    kb.add(
+        types.InlineKeyboardButton("💾 Резервная копия базы", callback_data="backup"),
+        types.InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings"),
+    )
     return kb
 
 
@@ -763,6 +796,42 @@ def back_menu() -> types.InlineKeyboardMarkup:
     return kb
 
 
+LOSS_ALERT_PRESETS = [0, 50, 100, 200, 500, 1000]
+SYNC_INTERVAL_PRESETS = [60, 300, 600, 900, 1800]
+CATEGORY_PRESETS = ["linear", "spot", "inverse"]
+
+
+def settings_menu() -> types.InlineKeyboardMarkup:
+    notify = get_setting("notify_new_trade", NOTIFY_ON_NEW_TRADE)
+    daily = get_setting("enable_daily_report", ENABLE_DAILY_REPORT)
+    weekly = get_setting("enable_weekly_report", ENABLE_WEEKLY_REPORT)
+    loss_limit = get_setting("max_daily_loss_alert", MAX_DAILY_LOSS_ALERT)
+    sync_interval = get_setting("sync_interval_sec", SYNC_INTERVAL_SEC)
+    category = get_setting("bybit_category", BYBIT_CATEGORY)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton(
+        f"🔔 Уведомления о сделках: {'Вкл ✅' if notify else 'Выкл ⛔'}", callback_data="toggle_notify"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        f"🗓 Ежедневный отчёт: {'Вкл ✅' if daily else 'Выкл ⛔'}", callback_data="toggle_daily"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        f"📅 Еженедельный отчёт: {'Вкл ✅' if weekly else 'Выкл ⛔'}", callback_data="toggle_weekly"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        f"⚠️ Риск-алерт: {(str(loss_limit) + ' USDT/сутки') if loss_limit > 0 else 'Выкл'}", callback_data="cycle_loss_alert"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        f"⏱ Интервал синхронизации: {sync_interval // 60} мин", callback_data="cycle_sync_interval"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        f"📂 Категория Bybit: {category}", callback_data="cycle_category"
+    ))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+    return kb
+
+
 PERIOD_NAMES = {1: "сегодня", 7: "7 дней", 30: "30 дней", 3650: "всё время"}
 
 
@@ -784,6 +853,7 @@ def cmd_start(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
+    global BYBIT_CATEGORY
     if not is_allowed(call.message.chat.id):
         return
 
@@ -861,6 +931,53 @@ def handle_callback(call):
             except FileNotFoundError:
                 bot.send_message(chat_id, "База данных пока пуста.", reply_markup=back_menu())
 
+        elif data == "menu_settings":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>\n\nНажимай, чтобы менять — сохраняется сразу, без передеплоя.", chat_id, msg_id, reply_markup=settings_menu())
+
+        elif data == "toggle_notify":
+            cur = get_setting("notify_new_trade", NOTIFY_ON_NEW_TRADE)
+            set_setting("notify_new_trade", not cur)
+            bot.answer_callback_query(call.id, "Готово")
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
+
+        elif data == "toggle_daily":
+            cur = get_setting("enable_daily_report", ENABLE_DAILY_REPORT)
+            set_setting("enable_daily_report", not cur)
+            bot.answer_callback_query(call.id, "Готово")
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
+
+        elif data == "toggle_weekly":
+            cur = get_setting("enable_weekly_report", ENABLE_WEEKLY_REPORT)
+            set_setting("enable_weekly_report", not cur)
+            bot.answer_callback_query(call.id, "Готово")
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
+
+        elif data == "cycle_loss_alert":
+            cur = get_setting("max_daily_loss_alert", MAX_DAILY_LOSS_ALERT)
+            idx = LOSS_ALERT_PRESETS.index(cur) if cur in LOSS_ALERT_PRESETS else 0
+            new_val = LOSS_ALERT_PRESETS[(idx + 1) % len(LOSS_ALERT_PRESETS)]
+            set_setting("max_daily_loss_alert", new_val)
+            bot.answer_callback_query(call.id, f"Риск-алерт: {new_val if new_val else 'выключен'}")
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
+
+        elif data == "cycle_sync_interval":
+            cur = get_setting("sync_interval_sec", SYNC_INTERVAL_SEC)
+            idx = SYNC_INTERVAL_PRESETS.index(cur) if cur in SYNC_INTERVAL_PRESETS else 0
+            new_val = SYNC_INTERVAL_PRESETS[(idx + 1) % len(SYNC_INTERVAL_PRESETS)]
+            set_setting("sync_interval_sec", new_val)
+            bot.answer_callback_query(call.id, f"Интервал: {new_val // 60} мин")
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
+
+        elif data == "cycle_category":
+            cur = get_setting("bybit_category", BYBIT_CATEGORY)
+            idx = CATEGORY_PRESETS.index(cur) if cur in CATEGORY_PRESETS else 0
+            new_val = CATEGORY_PRESETS[(idx + 1) % len(CATEGORY_PRESETS)]
+            set_setting("bybit_category", new_val)
+            BYBIT_CATEGORY = new_val
+            bot.answer_callback_query(call.id, f"Категория: {new_val}")
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
+
         elif data == "sync":
             bot.answer_callback_query(call.id, "Синхронизирую...")
             saved = sync_trades(silent_notify=True)
@@ -892,6 +1009,7 @@ if __name__ == "__main__":
         log.warning("Не удалось определить внешний IP: %s", e)
 
     init_db()
+    BYBIT_CATEGORY = get_setting("bybit_category", BYBIT_CATEGORY)
     threading.Thread(target=sync_loop, daemon=True).start()
     threading.Thread(target=daily_report_loop, daemon=True).start()
     threading.Thread(target=weekly_report_loop, daemon=True).start()
