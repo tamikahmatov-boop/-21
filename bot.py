@@ -37,20 +37,21 @@ MAX_DAILY_LOSS_ALERT = getattr(config, "MAX_DAILY_LOSS_ALERT", 0)
 START_TIME = datetime.now(timezone.utc)
 
 # ---------------------- База данных (учёт сделок) ----------------------
+# Оптимизация: держим одно постоянное соединение вместо open/close на каждый
+# запрос — это заметно быстрее на больших объёмах и снижает нагрузку на диск.
 
-_db_lock = threading.Lock()
-
-
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+_db_lock = threading.RLock()
+_conn: sqlite3.Connection = None
 
 
 def init_db():
+    global _conn
     with _db_lock:
-        conn = get_conn()
-        conn.execute(
+        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")   # быстрее и безопаснее при параллельных чтениях
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS trades (
                 id TEXT PRIMARY KEY,
@@ -65,28 +66,25 @@ def init_db():
             )
             """
         )
-        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-        conn.commit()
-        conn.close()
+        _conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        _conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_updated_time ON trades(updated_time)")
+        _conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
+        _conn.commit()
 
 
 def get_meta(key: str, default=None):
     with _db_lock:
-        conn = get_conn()
-        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-        conn.close()
+        row = _conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
 
 
 def set_meta(key: str, value):
     with _db_lock:
-        conn = get_conn()
-        conn.execute(
+        _conn.execute(
             "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, str(value)),
         )
-        conn.commit()
-        conn.close()
+        _conn.commit()
 
 
 def get_last_sync_time() -> int:
@@ -98,16 +96,15 @@ def set_last_sync_time(ts_ms: int):
 
 
 def upsert_trades(trades: list) -> list:
-    """Сохраняет сделки, возвращает список РЕАЛЬНО новых записей (для уведомлений)."""
+    """Сохраняет сделки одной транзакцией, возвращает список РЕАЛЬНО новых записей."""
     if not trades:
         return []
     new_trades = []
     with _db_lock:
-        conn = get_conn()
         for t in trades:
             trade_id = t.get("orderId") or t.get("execId") or f"{t.get('symbol')}_{t.get('updatedTime')}"
             try:
-                cur = conn.execute(
+                cur = _conn.execute(
                     """
                     INSERT INTO trades (id, symbol, side, qty, entry_price, exit_price, closed_pnl, created_time, updated_time)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -129,33 +126,28 @@ def upsert_trades(trades: list) -> list:
                     new_trades.append(t)
             except Exception:
                 continue
-        conn.commit()
-        conn.close()
+        _conn.commit()
     return new_trades
 
 
 def query_trades(start_ms: int, end_ms: int, symbol: str = None) -> list:
     with _db_lock:
-        conn = get_conn()
         if symbol:
-            rows = conn.execute(
+            rows = _conn.execute(
                 "SELECT * FROM trades WHERE updated_time BETWEEN ? AND ? AND symbol = ? ORDER BY updated_time ASC",
                 (start_ms, end_ms, symbol),
             ).fetchall()
         else:
-            rows = conn.execute(
+            rows = _conn.execute(
                 "SELECT * FROM trades WHERE updated_time BETWEEN ? AND ? ORDER BY updated_time ASC",
                 (start_ms, end_ms),
             ).fetchall()
-        conn.close()
     return [dict(r) for r in rows]
 
 
 def total_trade_count() -> int:
     with _db_lock:
-        conn = get_conn()
-        row = conn.execute("SELECT COUNT(*) AS c FROM trades").fetchone()
-        conn.close()
+        row = _conn.execute("SELECT COUNT(*) AS c FROM trades").fetchone()
     return row["c"] if row else 0
 
 
@@ -181,11 +173,9 @@ def set_setting(name: str, value):
 
 def distinct_symbols() -> list:
     with _db_lock:
-        conn = get_conn()
-        rows = conn.execute(
+        rows = _conn.execute(
             "SELECT symbol, COUNT(*) AS c FROM trades GROUP BY symbol ORDER BY c DESC LIMIT 20"
         ).fetchall()
-        conn.close()
     return [r["symbol"] for r in rows]
 
 
@@ -218,6 +208,41 @@ def call_with_retry(func, *args, retries=3, base_delay=1.5, **kwargs):
                 log.warning("Bybit API сбой (попытка %s/%s): %s. Повтор через %.1fс", attempt, retries, e, delay)
                 time.sleep(delay)
     raise last_err
+
+
+def notify_admin(text: str):
+    """Безопасная отправка сообщения администратору — никогда не бросает исключение."""
+    if not ALLOWED_CHAT_ID:
+        return
+    try:
+        bot.send_message(ALLOWED_CHAT_ID, text)
+    except Exception:
+        log.exception("Не удалось отправить admin-уведомление")
+
+
+# ---------------------- Мониторинг соединения с Bybit ----------------------
+
+_connection_state = {"is_down": False, "consecutive_failures": 0}
+
+
+def report_sync_result(success: bool, error: str = None):
+    """Отслеживает подряд идущие ошибки синхронизации и шлёт алерт о проблемах с доступом к Bybit."""
+    threshold = getattr(config, "CONSECUTIVE_ERROR_THRESHOLD", 3)
+    if success:
+        if _connection_state["is_down"]:
+            _connection_state["is_down"] = False
+            notify_admin("🟢 <b>Соединение с Bybit восстановлено.</b> Синхронизация снова работает штатно.")
+        _connection_state["consecutive_failures"] = 0
+    else:
+        _connection_state["consecutive_failures"] += 1
+        if _connection_state["consecutive_failures"] >= threshold and not _connection_state["is_down"]:
+            _connection_state["is_down"] = True
+            notify_admin(
+                f"🔴 <b>Проблема с подключением к Bybit</b>\n\n"
+                f"Последние {_connection_state['consecutive_failures']} попыток синхронизации завершились ошибкой:\n"
+                f"<code>{error}</code>\n\n"
+                f"Бот продолжит пытаться автоматически, дополнительно делать ничего не нужно."
+            )
 
 
 # ---------------------- Синхронизация закрытых сделок ----------------------
@@ -317,8 +342,10 @@ def sync_loop():
     while True:
         try:
             sync_trades()
+            report_sync_result(True)
         except Exception as e:
             log.error("Ошибка синхронизации: %s", str(e))
+            report_sync_result(False, str(e))
         time.sleep(get_setting("sync_interval_sec", SYNC_INTERVAL_SEC))
 
 
@@ -425,7 +452,7 @@ def get_balance_message() -> str:
 
 # ---------------------- Расширенная статистика по закрытым сделкам ----------------------
 
-def compute_stats(trades: list) -> dict:
+def compute_stats(trades: list, tz_offset: int = 0) -> dict:
     total_pnl = sum(t["closed_pnl"] for t in trades)
     wins = [t for t in trades if t["closed_pnl"] > 0]
     losses = [t for t in trades if t["closed_pnl"] < 0]
@@ -501,13 +528,13 @@ def compute_stats(trades: list) -> dict:
         by_symbol[sym]["pnl"] += t["closed_pnl"]
     top_symbols = sorted(by_symbol.items(), key=lambda kv: kv[1]["count"], reverse=True)[:5]
 
-    # анализ по дням недели и часам (когда сделки прибыльнее/убыточнее)
+    # анализ по дням недели и часам (когда сделки прибыльнее/убыточнее), с учётом часового пояса
     weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     by_weekday = {i: 0.0 for i in range(7)}
     by_hour = {i: 0.0 for i in range(24)}
     for t in trades:
         if t["updated_time"]:
-            dt = datetime.fromtimestamp(t["updated_time"] / 1000, tz=timezone.utc)
+            dt = datetime.fromtimestamp(t["updated_time"] / 1000, tz=timezone.utc) + timedelta(hours=tz_offset)
             by_weekday[dt.weekday()] += t["closed_pnl"]
             by_hour[dt.hour] += t["closed_pnl"]
 
@@ -571,7 +598,7 @@ def build_stats_message(period_name: str, days: int, symbol: str = None) -> str:
     if not trades:
         return f"{title}\n\nЗа этот период закрытых сделок не найдено."
 
-    s = compute_stats(trades)
+    s = compute_stats(trades, tz_offset=get_setting("tz_offset", 0))
 
     # сравнение с предыдущим таким же периодом (только для коротких периодов, не 'всё время')
     compare_str = ""
@@ -631,6 +658,34 @@ def build_stats_message(period_name: str, days: int, symbol: str = None) -> str:
 
 # ---------------------- График капитала (equity curve) ----------------------
 
+# ---------------------- Топ сделок ----------------------
+
+def build_top_trades_message(days: int, top_n: int = 5) -> str:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    trades = query_trades(int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+
+    period_name = PERIOD_NAMES.get(days, f"{days} дней")
+    if not trades:
+        return f"🏆 <b>Топ сделок ({period_name})</b>\n\nЗа этот период закрытых сделок не найдено."
+
+    best = sorted(trades, key=lambda t: t["closed_pnl"], reverse=True)[:top_n]
+    worst = sorted(trades, key=lambda t: t["closed_pnl"])[:top_n]
+
+    def fmt(t):
+        dt = datetime.fromtimestamp(t["updated_time"] / 1000, tz=timezone.utc).strftime("%d.%m %H:%M") if t["updated_time"] else "—"
+        return f"{t['symbol']} — <b>{t['closed_pnl']:.2f} USDT</b> ({dt})"
+
+    lines = [f"🏆 <b>Топ сделок ({period_name})</b>\n", f"<b>Лучшие {len(best)}:</b>"]
+    for i, t in enumerate(best, 1):
+        lines.append(f"{i}. {fmt(t)}")
+    lines.append(f"\n<b>Худшие {len(worst)}:</b>")
+    for i, t in enumerate(worst, 1):
+        lines.append(f"{i}. {fmt(t)}")
+
+    return "\n".join(lines)
+
+
 def build_equity_chart(days: int, symbol: str = None):
     """Строит PNG-график накопительного PnL. Возвращает BytesIO или None, если данных нет."""
     import matplotlib
@@ -688,6 +743,22 @@ def build_csv_export(days: int, symbol: str = None):
 
 # ---------------------- Статус бота ----------------------
 
+# ---------------------- Проверка соединения ----------------------
+
+def check_connection() -> str:
+    """Пингует Bybit и измеряет задержку — удобно для диагностики проблем с доступом."""
+    t0 = time.perf_counter()
+    try:
+        resp = call_with_retry(session.get_server_time, retries=1)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        ret_code = resp.get("retCode")
+        if ret_code == 0:
+            return f"🟢 <b>Соединение с Bybit в порядке</b>\n\nЗадержка: {latency_ms:.0f} мс"
+        return f"🟡 <b>Bybit ответил с кодом {ret_code}</b>\n\n{resp.get('retMsg', '')}"
+    except Exception as e:
+        return f"🔴 <b>Не удалось подключиться к Bybit</b>\n\n<code>{e}</code>"
+
+
 def build_status_message() -> str:
     uptime = datetime.now(timezone.utc) - START_TIME
     hours, rem = divmod(int(uptime.total_seconds()), 3600)
@@ -735,6 +806,31 @@ def is_allowed(chat_id) -> bool:
 
 PERIODS = [("Сегодня", 1), ("7 дней", 7), ("30 дней", 30), ("Всё время", 3650)]
 
+# Текст кнопок обычной (не inline) клавиатуры — она всегда висит внизу экрана
+BTN_STATS = "📊 Статистика"
+BTN_POSITIONS = "📈 Открытые позиции"
+BTN_CHART = "📉 График капитала"
+BTN_SYMBOLS = "🔎 По инструменту"
+BTN_TOP_TRADES = "🏆 Топ сделок"
+BTN_EXPORT = "📤 Экспорт CSV"
+BTN_BALANCE = "💰 Баланс"
+BTN_SYNC = "🔄 Синхронизировать"
+BTN_STATUS = "ℹ️ Статус"
+BTN_CHECK_CONN = "🩺 Проверить соединение"
+BTN_BACKUP = "💾 Резервная копия"
+BTN_SETTINGS = "⚙️ Настройки"
+
+
+def reply_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(types.KeyboardButton(BTN_STATS), types.KeyboardButton(BTN_POSITIONS))
+    kb.add(types.KeyboardButton(BTN_CHART), types.KeyboardButton(BTN_SYMBOLS))
+    kb.add(types.KeyboardButton(BTN_TOP_TRADES), types.KeyboardButton(BTN_EXPORT))
+    kb.add(types.KeyboardButton(BTN_BALANCE), types.KeyboardButton(BTN_SYNC))
+    kb.add(types.KeyboardButton(BTN_STATUS), types.KeyboardButton(BTN_CHECK_CONN))
+    kb.add(types.KeyboardButton(BTN_BACKUP), types.KeyboardButton(BTN_SETTINGS))
+    return kb
+
 
 def main_menu() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -749,6 +845,10 @@ def main_menu() -> types.InlineKeyboardMarkup:
     kb.add(
         types.InlineKeyboardButton("📤 Экспорт CSV", callback_data="menu_export"),
         types.InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🏆 Топ сделок", callback_data="menu_top"),
+        types.InlineKeyboardButton("🩺 Проверить соединение", callback_data="check_connection"),
     )
     kb.add(
         types.InlineKeyboardButton("🔄 Синхронизировать", callback_data="sync"),
@@ -799,6 +899,7 @@ def back_menu() -> types.InlineKeyboardMarkup:
 LOSS_ALERT_PRESETS = [0, 50, 100, 200, 500, 1000]
 SYNC_INTERVAL_PRESETS = [60, 300, 600, 900, 1800]
 CATEGORY_PRESETS = ["linear", "spot", "inverse"]
+TIMEZONE_PRESETS = [0, 1, 2, 3, 4, 5, -5]  # смещение от UTC в часах; 3 = МСК
 
 
 def settings_menu() -> types.InlineKeyboardMarkup:
@@ -808,6 +909,7 @@ def settings_menu() -> types.InlineKeyboardMarkup:
     loss_limit = get_setting("max_daily_loss_alert", MAX_DAILY_LOSS_ALERT)
     sync_interval = get_setting("sync_interval_sec", SYNC_INTERVAL_SEC)
     category = get_setting("bybit_category", BYBIT_CATEGORY)
+    tz_offset = get_setting("tz_offset", 0)
 
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton(
@@ -828,6 +930,10 @@ def settings_menu() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton(
         f"📂 Категория Bybit: {category}", callback_data="cycle_category"
     ))
+    kb.add(types.InlineKeyboardButton(
+        f"🌍 Часовой пояс (для «По времени»): UTC{tz_offset:+d}", callback_data="cycle_timezone"
+    ))
+    kb.add(types.InlineKeyboardButton("🔔 Отправить тестовое уведомление", callback_data="test_notify"))
     kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return kb
 
@@ -846,9 +952,57 @@ def cmd_start(message):
         "Привет! Я бот для учёта сделок Bybit.\n"
         "Сохраняю закрытые сделки, слежу за открытыми позициями и присылаю уведомления.\n\n"
         f"Твой chat_id: <code>{message.chat.id}</code>\n\n"
-        "Выбери, что показать:",
-        reply_markup=main_menu(),
+        "Кнопки снизу — быстрый доступ. Кнопки в сообщении — подробное меню.",
+        reply_markup=reply_keyboard(),
     )
+    bot.send_message(message.chat.id, "Выбери, что показать:", reply_markup=main_menu())
+
+
+@bot.message_handler(func=lambda m: m.text in {
+    BTN_STATS, BTN_POSITIONS, BTN_CHART, BTN_SYMBOLS, BTN_TOP_TRADES, BTN_EXPORT,
+    BTN_BALANCE, BTN_SYNC, BTN_STATUS, BTN_CHECK_CONN, BTN_BACKUP, BTN_SETTINGS,
+})
+def handle_reply_keyboard(message):
+    """Обрабатывает нажатия обычной (нижней) клавиатуры — присылает то же меню/данные, что и inline-кнопки."""
+    if not is_allowed(message.chat.id):
+        return
+    chat_id = message.chat.id
+    text = message.text
+
+    if text == BTN_STATS:
+        bot.send_message(chat_id, "За какой период показать статистику?", reply_markup=period_menu("stats"))
+    elif text == BTN_POSITIONS:
+        bot.send_message(chat_id, "Загружаю позиции...")
+        bot.send_message(chat_id, build_open_positions_message(), reply_markup=back_menu())
+    elif text == BTN_CHART:
+        bot.send_message(chat_id, "За какой период построить график?", reply_markup=period_menu("chart"))
+    elif text == BTN_SYMBOLS:
+        bot.send_message(chat_id, "Выбери инструмент:", reply_markup=symbols_menu())
+    elif text == BTN_TOP_TRADES:
+        bot.send_message(chat_id, "За какой период показать топ сделок?", reply_markup=period_menu("top"))
+    elif text == BTN_EXPORT:
+        bot.send_message(chat_id, "За какой период выгрузить CSV?", reply_markup=period_menu("export"))
+    elif text == BTN_BALANCE:
+        bot.send_message(chat_id, get_balance_message(), reply_markup=back_menu())
+    elif text == BTN_SYNC:
+        saved = sync_trades(silent_notify=True)
+        total = total_trade_count()
+        bot.send_message(chat_id, f"✅ Готово.\nНовых сделок сохранено: {saved}\nВсего в базе: {total}", reply_markup=back_menu())
+    elif text == BTN_STATUS:
+        bot.send_message(chat_id, build_status_message(), reply_markup=back_menu())
+    elif text == BTN_CHECK_CONN:
+        bot.send_message(chat_id, "Проверяю...")
+        bot.send_message(chat_id, check_connection(), reply_markup=back_menu())
+    elif text == BTN_BACKUP:
+        try:
+            with _db_lock:
+                _conn.execute("PRAGMA wal_checkpoint(FULL)")
+            with open(DB_PATH, "rb") as f:
+                bot.send_document(chat_id, types.InputFile(f, filename="trades_backup.db"), reply_markup=back_menu())
+        except FileNotFoundError:
+            bot.send_message(chat_id, "База данных пока пуста.", reply_markup=back_menu())
+    elif text == BTN_SETTINGS:
+        bot.send_message(chat_id, "⚙️ <b>Настройки бота</b>", reply_markup=settings_menu())
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -876,6 +1030,15 @@ def handle_callback(call):
 
         elif data == "menu_symbols":
             bot.edit_message_text("Выбери инструмент:", chat_id, msg_id, reply_markup=symbols_menu())
+
+        elif data == "menu_top":
+            bot.edit_message_text("За какой период показать топ сделок?", chat_id, msg_id, reply_markup=period_menu("top"))
+
+        elif data.startswith("top_"):
+            days = int(data.split("_")[1])
+            bot.answer_callback_query(call.id, "Считаю...")
+            msg = build_top_trades_message(days)
+            bot.edit_message_text(msg, chat_id, msg_id, reply_markup=period_menu("top"))
 
         elif data.startswith("stats_"):
             days = int(data.split("_")[1])
@@ -923,9 +1086,16 @@ def handle_callback(call):
             msg = build_status_message()
             bot.edit_message_text(msg, chat_id, msg_id, reply_markup=back_menu())
 
+        elif data == "check_connection":
+            bot.answer_callback_query(call.id, "Проверяю...")
+            msg = check_connection()
+            bot.edit_message_text(msg, chat_id, msg_id, reply_markup=back_menu())
+
         elif data == "backup":
             bot.answer_callback_query(call.id, "Готовлю файл базы...")
             try:
+                with _db_lock:
+                    _conn.execute("PRAGMA wal_checkpoint(FULL)")
                 with open(DB_PATH, "rb") as f:
                     bot.send_document(chat_id, types.InputFile(f, filename="trades_backup.db"), reply_markup=back_menu())
             except FileNotFoundError:
@@ -978,6 +1148,18 @@ def handle_callback(call):
             bot.answer_callback_query(call.id, f"Категория: {new_val}")
             bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
 
+        elif data == "cycle_timezone":
+            cur = get_setting("tz_offset", 0)
+            idx = TIMEZONE_PRESETS.index(cur) if cur in TIMEZONE_PRESETS else 0
+            new_val = TIMEZONE_PRESETS[(idx + 1) % len(TIMEZONE_PRESETS)]
+            set_setting("tz_offset", new_val)
+            bot.answer_callback_query(call.id, f"Часовой пояс: UTC{new_val:+d}")
+            bot.edit_message_text("⚙️ <b>Настройки бота</b>", chat_id, msg_id, reply_markup=settings_menu())
+
+        elif data == "test_notify":
+            bot.answer_callback_query(call.id, "Отправляю...")
+            notify_admin("🔔 Это тестовое уведомление. Если ты его видишь — уведомления работают исправно.")
+
         elif data == "sync":
             bot.answer_callback_query(call.id, "Синхронизирую...")
             saved = sync_trades(silent_notify=True)
@@ -998,26 +1180,99 @@ def handle_callback(call):
             pass
 
 
+# ---------------------- Супервизор: держит бота живым 24/7 ----------------------
+
+def supervised_thread(target, name: str):
+    """Оборачивает фоновую функцию: если она упадёт с исключением — залогирует,
+    уведомит администратора и перезапустит через паузу, вместо того чтобы тихо
+    погибнуть и оставить бота без синхронизации/отчётов."""
+
+    def wrapper():
+        while True:
+            try:
+                target()
+                break  # функция сама решила завершиться штатно (например, ALLOWED_CHAT_ID пуст)
+            except Exception as e:
+                log.exception("Поток '%s' упал", name)
+                notify_admin(
+                    f"⚠️ <b>Внутренний сбой</b>\n\n"
+                    f"Фоновый процесс «{name}» упал с ошибкой и будет перезапущен через 15 секунд:\n"
+                    f"<code>{e}</code>"
+                )
+                time.sleep(15)
+
+    t = threading.Thread(target=wrapper, name=name, daemon=True)
+    t.start()
+    return t
+
+
+def get_external_ip() -> str:
+    try:
+        import requests
+        return requests.get("https://api.ipify.org", timeout=5).text
+    except Exception as e:
+        log.warning("Не удалось определить внешний IP: %s", e)
+        return "неизвестен"
+
+
+def run_bot_forever():
+    """Главный цикл long-polling с автоперезапуском при любом сбое и защитой
+    от бесконечного цикла быстрых рестартов (экспоненциальный backoff)."""
+    restart_count = 0
+    max_delay = 300  # не ждать больше 5 минут между попытками
+
+    while True:
+        try:
+            if restart_count > 0:
+                notify_admin(f"✅ <b>Бот перезапущен</b> (попытка №{restart_count + 1}) и снова работает.")
+            restart_count = 0  # сбрасываем счётчик после успешного (без исключений) периода работы
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+            break  # infinity_polling завершился штатно (например, по остановке процесса)
+        except Exception as e:
+            restart_count += 1
+            delay = min(5 * restart_count, max_delay)
+            log.exception("Бот упал (попытка №%s), перезапуск через %sс", restart_count, delay)
+            notify_admin(
+                f"🔴 <b>Бот упал и перезапускается</b>\n\n"
+                f"Попытка №{restart_count}, повтор через {delay} сек:\n"
+                f"<code>{e}</code>"
+            )
+            time.sleep(delay)
+
+
+def setup_graceful_shutdown():
+    """Ловим SIGTERM/SIGINT (Railway шлёт их при остановке/передеплое) и уведомляем об этом,
+    чтобы отличать плановую остановку от настоящего краша."""
+    import signal
+
+    def handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        log.info("Получен сигнал %s — бот останавливается (вероятно, плановый передеплой).", sig_name)
+        notify_admin(f"🛑 <b>Бот остановлен</b> (сигнал {sig_name}) — обычно это плановый передеплой на Railway.")
+        raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, handler)
+        signal.signal(signal.SIGINT, handler)
+    except Exception:
+        pass  # на некоторых платформах не все сигналы доступны — не критично
+
+
 # ---------------------- Точка входа ----------------------
 
 if __name__ == "__main__":
-    try:
-        import requests
-        my_ip = requests.get("https://api.ipify.org", timeout=5).text
-        log.info("Внешний IP этого сервера: %s", my_ip)
-    except Exception as e:
-        log.warning("Не удалось определить внешний IP: %s", e)
+    setup_graceful_shutdown()
+
+    log.info("Внешний IP этого сервера: %s", get_external_ip())
 
     init_db()
     BYBIT_CATEGORY = get_setting("bybit_category", BYBIT_CATEGORY)
-    threading.Thread(target=sync_loop, daemon=True).start()
-    threading.Thread(target=daily_report_loop, daemon=True).start()
-    threading.Thread(target=weekly_report_loop, daemon=True).start()
+
+    supervised_thread(sync_loop, "Синхронизация сделок")
+    supervised_thread(daily_report_loop, "Ежедневный отчёт")
+    supervised_thread(weekly_report_loop, "Еженедельный отчёт")
 
     log.info("Бот запущен. Ожидаю команды...")
-    while True:
-        try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
-        except Exception as e:
-            log.exception("Бот упал, перезапуск через 5 секунд: %s", e)
-            time.sleep(5)
+    notify_admin("✅ <b>Бот запущен</b> и готов к работе 24/7.")
+
+    run_bot_forever()
