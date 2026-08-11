@@ -1,0 +1,9 @@
+BOT_TOKEN = "8934561429:AAE5Kvmq4Ky4HqVUmfeUjJcfY-8NDapZwEw"
+CHAT_ID = 6716942872
+PERCENT = 10
+WINDOW = 600 * 600
+INTERVAL = 5
+COOLDOWN = 600
+DB_KEEP_ALERTS_DAYS  = 7   # сколько дней хранить алерты
+DB_KEEP_LEVELS_DAYS  = 7    # сколько дней хранить уровни монет
+DB_VACUUM_INTERVAL_H = 24   # как часто делать VACUUM
